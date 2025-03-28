@@ -3,13 +3,25 @@ import subprocess
 import os
 import threading
 import json
+import glob
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import HTTPException
 from collections import defaultdict
+from contextlib import contextmanager
 
 executor = ThreadPoolExecutor()
 processes = defaultdict(dict)
 lock = threading.Lock()
+
+@contextmanager
+def change_directory(destination: str):
+    original_dir = os.getcwd()
+    try:
+        os.chdir(destination)
+        yield
+    finally:
+        os.chdir(original_dir)
+
 
 def run_subprocess(command: list, file_id: str, timeout: int = 30, input_data: str = None):
     with lock:
@@ -39,11 +51,12 @@ def run_subprocess(command: list, file_id: str, timeout: int = 30, input_data: s
 async def compile(src_filename: str, bin_filename: str):
     file_id = os.path.basename(src_filename).split('.')[0]
     command = [
-        "clang++-18", 
+        "g++", 
+        "-fopenmp",
         src_filename,
         "-o", bin_filename,
-        "-fopenmp",
-        '-lomp'
+        "-L/usr/lib",
+        "-lavcodec", "-lavformat", "-lavutil", "-lswscale",
     ]
     
     loop = asyncio.get_running_loop()
@@ -63,43 +76,32 @@ async def compile(src_filename: str, bin_filename: str):
                 "return_code": return_code
             }
 
-        input_analyzer_command = [
-            "./InputAnalyzer",
-            "-p", "./",
-            "--mode=vars",
-            src_filename,
-        ]
-        analyzer_rc, analyzer_stdout, analyzer_stderr = await loop.run_in_executor(
-            executor,
-            run_subprocess,
-            input_analyzer_command,
-            file_id
-        )
-
         return {
             "message": "Сборка прошла успешно",
-            "stdout": json.loads(analyzer_stdout),
+            "stdout": stdout,
             "stderr": stderr,
             "return_code": return_code,
-            "bin_filename": bin_filename
         }
         
     except Exception as e:
         raise HTTPException(500, f"Ошибка компиляции: {str(e)}")
 
 async def execute(bin_filename: str, file_id: str, input_data: str = None):
-    command = [bin_filename]
+    file_dir = os.path.dirname(bin_filename)
+    filename = os.path.basename(bin_filename)
+    command = [f"./{filename}"]
     loop = asyncio.get_running_loop()
     
     try:
-        return_code, stdout, stderr = await loop.run_in_executor(
-            executor,
-            run_subprocess,
-            command,
-            file_id,
-            60,
-            input_data
-        )
+        with change_directory(file_dir):
+            return_code, stdout, stderr = await loop.run_in_executor(
+                executor,
+                run_subprocess,
+                command,
+                file_id,
+                60,
+                input_data
+            )
         
         return {
             "message": "Выполнение завершено",
@@ -111,39 +113,57 @@ async def execute(bin_filename: str, file_id: str, input_data: str = None):
     except Exception as e:
         raise HTTPException(500, f"Ошибка выполнения: {str(e)}")
 
-async def function_declarations(src_filename):
-    file_id = os.path.basename(src_filename).split('.')[0]
-    command = [
-        "./InputAnalyzer",
-        "-p", "./",
-        "--mode=funcs",
-        src_filename,
-    ]
-
+async def execute_test(bin_filename: str, file_id: str, input_data: str = None):
+    file_dir = os.path.dirname(bin_filename)
+    filename = os.path.basename(bin_filename)
+    command = [f"./{filename}"]
     loop = asyncio.get_running_loop()
+    
     try:
-        return_code, stdout, stderr = await loop.run_in_executor(
+        with change_directory(file_dir):
+            return_code, stdout, stderr = await loop.run_in_executor(
                 executor,
                 run_subprocess,
                 command,
-                file_id
+                file_id,
+                60,
+                input_data
             )
-        if return_code != 0:
+            result = []
+            
+            for dir_entry in os.scandir('.'):
+                if dir_entry.is_dir():
+                    file_path = os.path.join(dir_entry.path, 'result.json')
+                    if os.path.exists(file_path):
+                        try:
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                data = {
+                                    "dir": dir_entry.name,
+                                    "data": json.load(f)
+                                }
+                                result.append(data)
+                        except (IOError, json.JSONDecodeError) as e:
+                            raise HTTPException(500, "Error read result file")
+
+        if len(result) == 0:
             return {
-                "message": f"Ошибка анализа: {stderr}",
-                "stdout": None,
+                "message": "Выполнение завершено",
+                "stdout": stdout,
                 "stderr": stderr,
                 "return_code": return_code
-            }
-        
+            }    
+
         return {
-            "message": "Сборка прошла успешно",
-            "stdout": json.loads(stdout),
+            "message": "Выполнение завершено",
+            "stdout": stdout,
             "stderr": stderr,
             "return_code": return_code,
+            "result": result
         }
+        
     except Exception as e:
-        raise HTTPException(500, f"Ошибка компиляции: {str(e)}")
+        raise HTTPException(500, f"Ошибка выполнения: {str(e)}")
+
 
 async def cancel(file_id: str):
     with lock:
