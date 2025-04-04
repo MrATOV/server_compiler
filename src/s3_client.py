@@ -22,7 +22,7 @@ class S3Client:
         except:
             self.client.create_bucket(Bucket=self.bucket)
 
-    async def upload_proc_files(self, user_id: str, results: dict):
+    def upload_proc_files(self, user_id: str, results: dict):
         try:
             for res in results:
                 dirname = os.path.join(os.getcwd(), '.data', f"{user_id}", res["dir"])
@@ -45,8 +45,8 @@ class S3Client:
         except Exception as e:
             raise HTTPException(500, f"Error uploading file: {e}")
         
-    def get_data_file(self, user_id: int, file_name: str):
-        s3_key = f'{user_id}/{file_name}'
+    def get_data_file(self, user_id: int, type: str, file_name: str):
+        s3_key = f'{user_id}/{type}/{file_name}'
         dir_path = os.path.join(os.getcwd(), ".data", f"{user_id}")
         if not os.path.exists(dir_path):
             os.makedirs(dir_path)

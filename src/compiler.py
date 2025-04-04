@@ -4,12 +4,12 @@ import os
 import threading
 import json
 import glob
+import time
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import HTTPException
 from collections import defaultdict
 from contextlib import contextmanager
 
-executor = ThreadPoolExecutor()
 processes = defaultdict(dict)
 lock = threading.Lock()
 
@@ -48,7 +48,7 @@ def run_subprocess(command: list, file_id: str, timeout: int = 30, input_data: s
     
     return return_code, stdout, stderr
 
-async def compile(src_filename: str, bin_filename: str):
+def compile(src_filename: str, bin_filename: str):
     file_id = os.path.basename(src_filename).split('.')[0]
     command = [
         "g++", 
@@ -59,14 +59,8 @@ async def compile(src_filename: str, bin_filename: str):
         "-lavcodec", "-lavformat", "-lavutil", "-lswscale",
     ]
     
-    loop = asyncio.get_running_loop()
     try:
-        return_code, stdout, stderr = await loop.run_in_executor(
-            executor,
-            run_subprocess,
-            command,
-            file_id
-        )
+        return_code, stdout, stderr = run_subprocess(command, file_id)
         
         if return_code != 0:
             return {
@@ -86,22 +80,14 @@ async def compile(src_filename: str, bin_filename: str):
     except Exception as e:
         raise HTTPException(500, f"Ошибка компиляции: {str(e)}")
 
-async def execute(bin_filename: str, file_id: str, input_data: str = None):
+def execute(bin_filename: str, file_id: str, input_data: str = None):
     file_dir = os.path.dirname(bin_filename)
     filename = os.path.basename(bin_filename)
     command = [f"./{filename}"]
-    loop = asyncio.get_running_loop()
     
     try:
         with change_directory(file_dir):
-            return_code, stdout, stderr = await loop.run_in_executor(
-                executor,
-                run_subprocess,
-                command,
-                file_id,
-                60,
-                input_data
-            )
+            return_code, stdout, stderr = run_subprocess(command, file_id, 600, input_data)
         
         return {
             "message": "Выполнение завершено",
@@ -113,22 +99,14 @@ async def execute(bin_filename: str, file_id: str, input_data: str = None):
     except Exception as e:
         raise HTTPException(500, f"Ошибка выполнения: {str(e)}")
 
-async def execute_test(bin_filename: str, file_id: str, input_data: str = None):
+def execute_test(bin_filename: str, file_id: str, input_data: str = None):
     file_dir = os.path.dirname(bin_filename)
     filename = os.path.basename(bin_filename)
     command = [f"./{filename}"]
-    loop = asyncio.get_running_loop()
     
     try:
         with change_directory(file_dir):
-            return_code, stdout, stderr = await loop.run_in_executor(
-                executor,
-                run_subprocess,
-                command,
-                file_id,
-                60,
-                input_data
-            )
+            return_code, stdout, stderr = run_subprocess(command, file_id, 60, input_data)
             result = []
             
             for dir_entry in os.scandir('.'):
@@ -165,13 +143,13 @@ async def execute_test(bin_filename: str, file_id: str, input_data: str = None):
         raise HTTPException(500, f"Ошибка выполнения: {str(e)}")
 
 
-async def cancel(file_id: str):
+def cancel(file_id: str):
     with lock:
         if file_id in processes and processes[file_id].get('process'):
             process = processes[file_id]['process']
             try:
                 process.terminate()
-                await asyncio.sleep(1)
+                time.sleep(1)
                 if process.poll() is None:
                     process.kill()
                 return {"message": "Процесс остановлен"}

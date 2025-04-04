@@ -1,40 +1,45 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import src.compiler as compiler
 import os
-import uuid
 import asyncio
-import time
 import httpx
 import uvicorn
+from celery.signals import worker_process_init
 
+from src.dependencies import get_celery_app, redis_client
+from src.config import settings
+from src.utils import *
+from src.tasks import *
 from src.schemas import *
 from src.s3_client import S3Client
 from src.test_generator import generate_data
+from src.system_info import get_system_info
 
-def clean_startup_files():
-    for filename in os.listdir('/tmp'):
-        if filename.endswith(('.cpp', '.out')):
-            file_path = os.path.join('/tmp', filename)
-            try:
-                os.unlink(file_path)
-                print(f"Удален старый файл: {filename}")
-            except Exception as e:
-                print(f"Ошибка при удалении файла {filename}: {e}")
+router = APIRouter()
+
+app_celery = get_celery_app()
+
+@worker_process_init.connect
+def configure_flower(sender=None, conf=None, **kwargs):
+    if sender and sender.hostname.startswith('celery@'):
+        from flower.app import Flower
+        flower = Flower(celery_app=sender.app)
+        flower.start()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    clean_startup_files()
-    cleaner_task = asyncio.create_task(clean_old_files())
+    cleaner_task = asyncio.create_task(clean_old_files("/tmp", ".cpp", 60))
+    checker_task = asyncio.create_task(check_unacknowledged_tasks())
     dir_path = os.path.join(os.getcwd(), ".data")
     if not os.path.exists(dir_path):
         os.makedirs(dir_path)
     yield
     cleaner_task.cancel()
+    checker_task.cancel()
     try:
-        await cleaner_task
+        await asyncio.gather(cleaner_task, checker_task)
     except asyncio.CancelledError:
         pass
 
@@ -50,37 +55,16 @@ app.add_middleware(
 
 s3_client = S3Client()
 
-async def clean_old_files():
-    try:
-        while True:
-            await asyncio.sleep(60)
-            now = time.time()
-            for filename in os.listdir('/tmp'):
-                if filename.endswith('.cpp'):
-                    file_path = os.path.join('/tmp', filename)
-                    if os.stat(file_path).st_mtime < now - 600:
-                        try:
-                            os.unlink(file_path)
-                            print(f"Удален устаревший файл: {filename}")
-                        except:
-                            pass
-            for filename in os.listdir('./.data/1'):
-                file_path = os.path.join(os.getcwd(), '.data', '1', filename)
-                if os.stat(file_path).st_mtime < now - 600:
-                    try:
-                        os.unlink(file_path)
-                        print(f"Удален устаревший файл: {filename}")
-                    except:
-                        pass
-    except asyncio.CancelledError:
-        print("Фоновая очистка файлов остановлена")
+@app.get('/system')
+async def get_processor_info():
+    return get_system_info()
 
 @app.post('/functions')
 async def get_function_declarations(request: CompileRequest):
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
-                "http://input_analyzer:8003/analyze",
+                settings.input_analyzer_url,
                 json={"type": "funcs", "content": request.code}
             )
             response.raise_for_status()
@@ -90,86 +74,53 @@ async def get_function_declarations(request: CompileRequest):
 
 @app.post('/compile')
 async def compile_code(request: CompileRequest):
-    file_id = str(uuid.uuid4())
-    src_filename = f"/tmp/{file_id}.cpp"
-    bin_filename = f"./.data/{request.user_id}/{file_id}.out"
-    
-    with open(src_filename, 'w') as f:
-        f.write(request.code)
-    
-    try:
-        result = await compiler.compile(src_filename, bin_filename)
-
-    finally:
-        if os.path.exists(src_filename):
-            os.unlink(src_filename)
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(
-                "http://input_analyzer:8003/analyze",
-                json={"type": "vars", "content": request.code}
-            )
-            response.raise_for_status()
-            result["stdout"] = response.json()
-        except httpx.HTTPError as e:
-            raise HTTPException(500, e)
-    if result["return_code"] == 1:
-        return result
-    strings = result["stdout"].pop("strings")
-    if strings:
-        for string in strings:
-            s3_client.get_data_file(request.user_id, string) 
-    result["file_id"] = file_id
-    return result
+    task = compile_task.delay(request.code, request.user_id)
+    return {"task_id": task.id}
 
 @app.post('/execute/{file_id}')
 async def execute_code(file_id: str, request: ExecuteRequest):
-    bin_filename = f"./.data/{request.user_id}/{file_id}.out"
-    if not os.path.exists(bin_filename):
-        raise HTTPException(404, "Скомпилированный файл не найден")
-    
-    try:
-        result = await compiler.execute(bin_filename, file_id, request.input_data)
-    finally:
-        if os.path.exists(bin_filename):
-            os.utime(bin_filename)
-    return result
+    task = execute_task.delay(file_id, request.user_id, request.input_data)
+    return {"task_id": task.id}
 
 @app.post('/test/{file_id}')
 async def execute_test(file_id: str, request: ExecuteRequest):
-    bin_filename = f"./.data/{request.user_id}/{file_id}.out"
-    if not os.path.exists(bin_filename):
-        raise HTTPException(404, "Скомпилированный файл не найден")
-    
-    try:
-        result = await compiler.execute_test(bin_filename, file_id, request.input_data)
-    finally:
-        if os.path.exists(bin_filename):
-            os.utime(bin_filename)
-    if "result" in result:
-        await s3_client.upload_proc_files(request.user_id, result["result"])            
-    return result
+    task = execute_test_task.delay(file_id, request.user_id, request.input_data)
+    return {"task_id": task.id}
 
 @app.post('/cancel/{file_id}')
 async def cancel_process(file_id: str):
-    result = await compiler.cancel(file_id)
-    for ext in ('.cpp'):
-        filename = f"/tmp/{file_id}{ext}"
-        if os.path.exists(filename):
-            try:
-                os.unlink(filename)
-            except:
-                pass
-    return result
+    task = cancel_task.delay(file_id)
+    return {"task_id": task.id}
 
 @app.post('/generate')
 async def test_generate(data: TestDataRequest):
     return generate_data(data)
 
+@app.get("/task/{task_id}/status")
+async def get_task_status(task_id: str, ack: bool = True):
+    task_result = app_celery.AsyncResult(task_id)
+    
+    if task_result.state == 'SUCCESS':
+        if ack:
+            redis_client.delete(f"pending_ack:{task_id}")
+        needs_ack = redis_client.exists(f"pending_ack:{task_id}")
+        return {
+            "status": "SUCCESS",
+            "result": task_result.result,
+            "requires_acknowledgment": bool(needs_ack) if not ack else False
+        }
+    
+    return {"status": task_result.state}
+
+@router.post("/task/{task_id}/acknowledge")
+async def acknowledge_result(task_id: str, user_id: str):
+    redis_client.delete(f"pending_ack:{task_id}")
+    return {"status": "acknowledged"}
+
 @app.middleware("http")
 async def timeout_middleware(request, call_next):
     try:
-        return await asyncio.wait_for(call_next(request), timeout=60)
+        return await asyncio.wait_for(call_next(request), timeout=600)
     except asyncio.TimeoutError:
         return JSONResponse(
             {"message": "Превышено время выполнения запроса"},
