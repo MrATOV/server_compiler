@@ -22,6 +22,8 @@ def _store_task_info(task_id: str, user_id: str, operation: str):
 @shared_task(bind=True)
 def compile_task(self, code: str, user_id: str):
     _store_task_info(self.request.id, user_id, "compile")
+    if not os.path.exists(f'./.data/{user_id}'):
+        os.makedirs(f'./.data/{user_id}')
     file_id = str(uuid.uuid4())
     src_filename = f"/tmp/{file_id}.cpp"
     bin_filename = f"./.data/{user_id}/{file_id}.out"
@@ -46,7 +48,6 @@ def compile_task(self, code: str, user_id: str):
             return result
         
         strings = result["stdout"].pop("strings")
-        print(strings)
         if strings:
             for string in strings:
                 s3_client.get_data_file(user_id, string["type"], string["filename"])
@@ -105,6 +106,7 @@ def execute_test_task(self, file_id: str, user_id: str, input_data: str = None):
     
     try:
         result = compiler.execute_test(bin_filename, file_id, input_data)
+        
         if "result" in result:
             s3_client.upload_proc_files(user_id, result["result"])
 
@@ -117,7 +119,6 @@ def execute_test_task(self, file_id: str, user_id: str, input_data: str = None):
             }
         )
         redis_client.expire(f"pending_ack:{self.request.id}", 20)
-
         return result
     except Exception as e:
         redis_client.delete(f"pending_ack:{self.request.id}")

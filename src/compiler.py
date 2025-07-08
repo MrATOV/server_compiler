@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import HTTPException
 from collections import defaultdict
 from contextlib import contextmanager
+from src.parallel_implemantation_analyzer import analyze_parallel_performance
 
 processes = defaultdict(dict)
 lock = threading.Lock()
@@ -58,7 +59,6 @@ def compile(src_filename: str, bin_filename: str):
         "-L/usr/lib",
         "-lavcodec", "-lavformat", "-lavutil", "-lswscale",
     ]
-    
     try:
         return_code, stdout, stderr = run_subprocess(command, file_id)
         
@@ -69,7 +69,6 @@ def compile(src_filename: str, bin_filename: str):
                 "stderr": stderr,
                 "return_code": return_code
             }
-
         return {
             "message": "Сборка прошла успешно",
             "stdout": stdout,
@@ -115,14 +114,12 @@ def execute_test(bin_filename: str, file_id: str, input_data: str = None):
                     if os.path.exists(file_path):
                         try:
                             with open(file_path, 'r', encoding='utf-8') as f:
-                                data = {
-                                    "dir": dir_entry.name,
-                                    "data": json.load(f)
-                                }
+                                load_data = json.load(f)
+                                data = analyze_parallel_performance(load_data)
+                                data['dir'] = dir_entry.name
                                 result.append(data)
-                        except (IOError, json.JSONDecodeError) as e:
-                            raise HTTPException(500, "Error read result file")
-
+                        except Exception as e:
+                            raise HTTPException(500, f"Error read result file: {str(e)}")
         if len(result) == 0:
             return {
                 "message": "Выполнение завершено",
