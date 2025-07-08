@@ -3,13 +3,26 @@ import subprocess
 import os
 import threading
 import json
+import glob
+import time
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import HTTPException
 from collections import defaultdict
+from contextlib import contextmanager
+from src.parallel_implemantation_analyzer import analyze_parallel_performance
 
-executor = ThreadPoolExecutor()
 processes = defaultdict(dict)
 lock = threading.Lock()
+
+@contextmanager
+def change_directory(destination: str):
+    original_dir = os.getcwd()
+    try:
+        os.chdir(destination)
+        yield
+    finally:
+        os.chdir(original_dir)
+
 
 def run_subprocess(command: list, file_id: str, timeout: int = 30, input_data: str = None):
     with lock:
@@ -36,24 +49,18 @@ def run_subprocess(command: list, file_id: str, timeout: int = 30, input_data: s
     
     return return_code, stdout, stderr
 
-async def compile(src_filename: str, bin_filename: str):
+def compile(src_filename: str, bin_filename: str):
     file_id = os.path.basename(src_filename).split('.')[0]
     command = [
-        "clang++-18", 
+        "g++", 
+        "-fopenmp",
         src_filename,
         "-o", bin_filename,
-        "-fopenmp",
-        '-lomp'
+        "-L/usr/lib",
+        "-lavcodec", "-lavformat", "-lavutil", "-lswscale",
     ]
-    
-    loop = asyncio.get_running_loop()
     try:
-        return_code, stdout, stderr = await loop.run_in_executor(
-            executor,
-            run_subprocess,
-            command,
-            file_id
-        )
+        return_code, stdout, stderr = run_subprocess(command, file_id)
         
         if return_code != 0:
             return {
@@ -62,44 +69,24 @@ async def compile(src_filename: str, bin_filename: str):
                 "stderr": stderr,
                 "return_code": return_code
             }
-
-        input_analyzer_command = [
-            "./InputAnalyzer",
-            "-p", "./",
-            "--mode=vars",
-            src_filename,
-        ]
-        analyzer_rc, analyzer_stdout, analyzer_stderr = await loop.run_in_executor(
-            executor,
-            run_subprocess,
-            input_analyzer_command,
-            file_id
-        )
-
         return {
             "message": "Сборка прошла успешно",
-            "stdout": json.loads(analyzer_stdout),
+            "stdout": stdout,
             "stderr": stderr,
             "return_code": return_code,
-            "bin_filename": bin_filename
         }
         
     except Exception as e:
         raise HTTPException(500, f"Ошибка компиляции: {str(e)}")
 
-async def execute(bin_filename: str, file_id: str, input_data: str = None):
-    command = [bin_filename]
-    loop = asyncio.get_running_loop()
+def execute(bin_filename: str, file_id: str, input_data: str = None):
+    file_dir = os.path.dirname(bin_filename)
+    filename = os.path.basename(bin_filename)
+    command = [f"./{filename}"]
     
     try:
-        return_code, stdout, stderr = await loop.run_in_executor(
-            executor,
-            run_subprocess,
-            command,
-            file_id,
-            60,
-            input_data
-        )
+        with change_directory(file_dir):
+            return_code, stdout, stderr = run_subprocess(command, file_id, 600, input_data)
         
         return {
             "message": "Выполнение завершено",
@@ -111,47 +98,55 @@ async def execute(bin_filename: str, file_id: str, input_data: str = None):
     except Exception as e:
         raise HTTPException(500, f"Ошибка выполнения: {str(e)}")
 
-async def function_declarations(src_filename):
-    file_id = os.path.basename(src_filename).split('.')[0]
-    command = [
-        "./InputAnalyzer",
-        "-p", "./",
-        "--mode=funcs",
-        src_filename,
-    ]
-
-    loop = asyncio.get_running_loop()
+def execute_test(bin_filename: str, file_id: str, input_data: str = None):
+    file_dir = os.path.dirname(bin_filename)
+    filename = os.path.basename(bin_filename)
+    command = [f"./{filename}"]
+    
     try:
-        return_code, stdout, stderr = await loop.run_in_executor(
-                executor,
-                run_subprocess,
-                command,
-                file_id
-            )
-        if return_code != 0:
+        with change_directory(file_dir):
+            return_code, stdout, stderr = run_subprocess(command, file_id, 60, input_data)
+            result = []
+            
+            for dir_entry in os.scandir('.'):
+                if dir_entry.is_dir():
+                    file_path = os.path.join(dir_entry.path, 'result.json')
+                    if os.path.exists(file_path):
+                        try:
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                load_data = json.load(f)
+                                data = analyze_parallel_performance(load_data)
+                                data['dir'] = dir_entry.name
+                                result.append(data)
+                        except Exception as e:
+                            raise HTTPException(500, f"Error read result file: {str(e)}")
+        if len(result) == 0:
             return {
-                "message": f"Ошибка анализа: {stderr}",
-                "stdout": None,
+                "message": "Выполнение завершено",
+                "stdout": stdout,
                 "stderr": stderr,
                 "return_code": return_code
-            }
-        
+            }    
+
         return {
-            "message": "Сборка прошла успешно",
-            "stdout": json.loads(stdout),
+            "message": "Выполнение завершено",
+            "stdout": stdout,
             "stderr": stderr,
             "return_code": return_code,
+            "result": result
         }
+        
     except Exception as e:
-        raise HTTPException(500, f"Ошибка компиляции: {str(e)}")
+        raise HTTPException(500, f"Ошибка выполнения: {str(e)}")
 
-async def cancel(file_id: str):
+
+def cancel(file_id: str):
     with lock:
         if file_id in processes and processes[file_id].get('process'):
             process = processes[file_id]['process']
             try:
                 process.terminate()
-                await asyncio.sleep(1)
+                time.sleep(1)
                 if process.poll() is None:
                     process.kill()
                 return {"message": "Процесс остановлен"}

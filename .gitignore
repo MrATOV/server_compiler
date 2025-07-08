@@ -5,7 +5,8 @@ __pycache__/
 
 compile_commands.json
 InputAnalyzer
-
+ParallelTesting
+.data
 
 # C extensions
 *.so
